@@ -29,13 +29,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jpmorganchase/quorum-security-plugin-sdk-go/proto"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/common/prque"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/core/mps"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
@@ -135,6 +134,8 @@ type CacheConfig struct {
 	SnapshotLimit       int           // Memory allowance (MB) to use for caching snapshot entries in memory
 
 	SnapshotWait bool // Wait for snapshot construction on startup. TODO(karalabe): This is a dirty hack for testing, nuke it
+
+	PrivateTrieCleanJournal string // Quorum: Disk journal for saving clean private cache entries.
 }
 
 // defaultCacheConfig are the default caching values if none are specified by the
@@ -211,33 +212,29 @@ type BlockChain struct {
 	processor  Processor  // Block transaction processor interface
 	vmConfig   vm.Config
 
-	badBlocks       *lru.Cache                         // Bad block cache
-	shouldPreserve  func(*types.Block) bool            // Function used to determine whether should preserve the given block.
-	terminateInsert func(common.Hash, uint64) bool     // Testing hook used to terminate ancient receipt chain insertion.
-	setPrivateState func([]*types.Log, *state.StateDB) // Function to check extension and set private state
+	badBlocks          *lru.Cache                     // Bad block cache
+	shouldPreserve     func(*types.Block) bool        // Function used to determine whether should preserve the given block.
+	terminateInsert    func(common.Hash, uint64) bool // Testing hook used to terminate ancient receipt chain insertion.
+	writeLegacyJournal bool                           // Testing flag used to flush the snapshot journal in legacy format.
 
-	privateStateCache state.Database // Private state database to reuse between imports (contains state cache)
-	isMultitenant     bool           // if this blockchain supports multitenancy
-}
+	// Quorum
+	quorumConfig    *QuorumChainConfig                                               // quorum chain config holds all the possible configuration fields for GoQuorum
+	setPrivateState func([]*types.Log, *state.StateDB, types.PrivateStateIdentifier) // Function to check extension and set private state
 
-// function pointer for updating private state
-func (bc *BlockChain) PopulateSetPrivateState(ps func([]*types.Log, *state.StateDB)) {
-	bc.setPrivateState = ps
-}
-
-// function to update the private state as a part contract state extension
-func (bc *BlockChain) CheckAndSetPrivateState(txLogs []*types.Log, privateState *state.StateDB) {
-	if bc.setPrivateState != nil {
-		bc.setPrivateState(txLogs, privateState)
-	}
+	// privateStateManager manages private state(s) for this blockchain
+	privateStateManager mps.PrivateStateManager
+	// End Quorum
 }
 
 // NewBlockChain returns a fully initialised block chain using information
 // available in the database. It initialises the default Ethereum Validator and
 // Processor.
-func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, engine consensus.Engine, vmConfig vm.Config, shouldPreserve func(block *types.Block) bool, txLookupLimit *uint64) (*BlockChain, error) {
+func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, engine consensus.Engine, vmConfig vm.Config, shouldPreserve func(block *types.Block) bool, txLookupLimit *uint64, quorumChainConfig *QuorumChainConfig) (*BlockChain, error) {
 	if cacheConfig == nil {
 		cacheConfig = defaultCacheConfig
+	}
+	if quorumChainConfig == nil {
+		quorumChainConfig = &QuorumChainConfig{}
 	}
 	bodyCache, _ := lru.New(bodyCacheLimit)
 	bodyRLPCache, _ := lru.New(bodyCacheLimit)
@@ -248,29 +245,34 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 	badBlocks, _ := lru.New(badBlockLimit)
 
 	bc := &BlockChain{
-		chainConfig:       chainConfig,
-		cacheConfig:       cacheConfig,
-		db:                db,
-		triegc:            prque.New(nil),
-		stateCache:        state.NewDatabaseWithCache(db, cacheConfig.TrieCleanLimit, cacheConfig.TrieCleanJournal),
-		quit:              make(chan struct{}),
-		shouldPreserve:    shouldPreserve,
-		bodyCache:         bodyCache,
-		bodyRLPCache:      bodyRLPCache,
-		receiptsCache:     receiptsCache,
-		blockCache:        blockCache,
-		txLookupCache:     txLookupCache,
-		futureBlocks:      futureBlocks,
-		engine:            engine,
-		vmConfig:          vmConfig,
-		badBlocks:         badBlocks,
-		privateStateCache: state.NewDatabase(db),
+		chainConfig:    chainConfig,
+		cacheConfig:    cacheConfig,
+		db:             db,
+		triegc:         prque.New(nil),
+		stateCache:     state.NewDatabaseWithCache(db, cacheConfig.TrieCleanLimit, cacheConfig.TrieCleanJournal),
+		quit:           make(chan struct{}),
+		shouldPreserve: shouldPreserve,
+		bodyCache:      bodyCache,
+		bodyRLPCache:   bodyRLPCache,
+		receiptsCache:  receiptsCache,
+		blockCache:     blockCache,
+		txLookupCache:  txLookupCache,
+		futureBlocks:   futureBlocks,
+		engine:         engine,
+		vmConfig:       vmConfig,
+		badBlocks:      badBlocks,
+		// Quorum
+		quorumConfig: quorumChainConfig,
 	}
 	bc.validator = NewBlockValidator(chainConfig, bc, engine)
 	bc.prefetcher = newStatePrefetcher(chainConfig, bc, engine)
 	bc.processor = NewStateProcessor(chainConfig, bc, engine)
 
 	var err error
+	// Quorum: attempt to initialize PSM
+	if bc.privateStateManager, err = newPrivateStateManager(bc.db, cacheConfig, chainConfig.IsMPS); err != nil {
+		return nil, err
+	}
 	bc.hc, err = NewHeaderChain(db, chainConfig, engine, bc.insertStopped)
 	if err != nil {
 		return nil, err
@@ -302,14 +304,34 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 	// Make sure the state associated with the block is available
 	head := bc.CurrentBlock()
 	if _, err := state.New(head.Root(), bc.stateCache, bc.snaps); err != nil {
-		log.Warn("Head state missing, repairing", "number", head.Number(), "hash", head.Hash())
-		if err := bc.SetHead(head.NumberU64()); err != nil {
-			return nil, err
+		// Head state is missing, before the state recovery, find out the
+		// disk layer point of snapshot(if it's enabled). Make sure the
+		// rewound point is lower than disk layer.
+		var diskRoot common.Hash
+		if bc.cacheConfig.SnapshotLimit > 0 {
+			diskRoot = rawdb.ReadSnapshotRoot(bc.db)
+		}
+		if diskRoot != (common.Hash{}) {
+			log.Warn("Head state missing, repairing", "number", head.Number(), "hash", head.Hash(), "snaproot", diskRoot)
+
+			snapDisk, err := bc.SetHeadBeyondRoot(head.NumberU64(), diskRoot)
+			if err != nil {
+				return nil, err
+			}
+			// Chain rewound, persist old snapshot number to indicate recovery procedure
+			if snapDisk != 0 {
+				rawdb.WriteSnapshotRecoveryNumber(bc.db, snapDisk)
+			}
+		} else {
+			log.Warn("Head state missing, repairing", "number", head.Number(), "hash", head.Hash())
+			if err := bc.SetHead(head.NumberU64()); err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	// Quorum
-	if _, err := state.New(rawdb.GetPrivateStateRoot(bc.db, head.Root()), bc.privateStateCache, nil); err != nil {
+	if err := bc.privateStateManager.CheckAt(head.Root()); err != nil {
 		log.Warn("Head private state missing, resetting chain", "number", head.Number(), "hash", head.Hash())
 		return nil, bc.Reset()
 	}
@@ -368,12 +390,25 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 	}
 	// Load any existing snapshot, regenerating it if loading failed
 	if bc.cacheConfig.SnapshotLimit > 0 {
-		bc.snaps = snapshot.New(bc.db, bc.stateCache.TrieDB(), bc.cacheConfig.SnapshotLimit, bc.CurrentBlock().Root(), !bc.cacheConfig.SnapshotWait)
+		// If the chain was rewound past the snapshot persistent layer (causing
+		// a recovery block number to be persisted to disk), check if we're still
+		// in recovery mode and in that case, don't invalidate the snapshot on a
+		// head mismatch.
+		var recover bool
+
+		head := bc.CurrentBlock()
+		if layer := rawdb.ReadSnapshotRecoveryNumber(bc.db); layer != nil && *layer > head.NumberU64() {
+			log.Warn("Enabling snapshot recovery", "chainhead", head.NumberU64(), "diskbase", *layer)
+			recover = true
+		}
+		bc.snaps = snapshot.New(bc.db, bc.stateCache.TrieDB(), bc.cacheConfig.SnapshotLimit, head.Root(), !bc.cacheConfig.SnapshotWait, recover)
 	}
 	// Take ownership of this particular state
 	go bc.update()
 	if txLookupLimit != nil {
 		bc.txLookupLimit = *txLookupLimit
+
+		bc.wg.Add(1)
 		go bc.maintainTxIndex(txIndexBlock)
 	}
 	// If periodic cache journal is required, spin it up.
@@ -383,23 +418,41 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 			bc.cacheConfig.TrieCleanRejournal = time.Minute
 		}
 		triedb := bc.stateCache.TrieDB()
-		bc.wg.Add(1)
+		bc.wg.Add(2)
 		go func() {
 			defer bc.wg.Done()
 			triedb.SaveCachePeriodically(bc.cacheConfig.TrieCleanJournal, bc.cacheConfig.TrieCleanRejournal, bc.quit)
+		}()
+		privatetriedb := bc.PrivateStateManager()
+		go func() {
+			defer bc.wg.Done()
+			privatetriedb.TrieDB().SaveCachePeriodically(bc.cacheConfig.PrivateTrieCleanJournal, bc.cacheConfig.TrieCleanRejournal, bc.quit)
 		}()
 	}
 	return bc, nil
 }
 
 // Quorum
-func NewMultitenantBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, engine consensus.Engine, vmConfig vm.Config, shouldPreserve func(block *types.Block) bool, txLookupLimit *uint64) (*BlockChain, error) {
-	bc, err := NewBlockChain(db, cacheConfig, chainConfig, engine, vmConfig, shouldPreserve, txLookupLimit)
+// Decorates NewBlockChain with multitenancy flag
+func NewMultitenantBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, engine consensus.Engine, vmConfig vm.Config, shouldPreserve func(block *types.Block) bool, txLookupLimit *uint64, quorumChainConfig *QuorumChainConfig) (*BlockChain, error) {
+	if quorumChainConfig == nil {
+		quorumChainConfig = &QuorumChainConfig{multiTenantEnabled: true}
+	} else {
+		quorumChainConfig.multiTenantEnabled = true
+	}
+	bc, err := NewBlockChain(db, cacheConfig, chainConfig, engine, vmConfig, shouldPreserve, txLookupLimit, quorumChainConfig)
 	if err != nil {
 		return nil, err
 	}
-	bc.isMultitenant = true
 	return bc, err
+}
+
+func (bc *BlockChain) PrivateStateManager() mps.PrivateStateManager {
+	return bc.privateStateManager
+}
+
+func (bc *BlockChain) SetPrivateStateManager(psm mps.PrivateStateManager) {
+	bc.privateStateManager = psm
 }
 
 // End Quorum
@@ -440,6 +493,20 @@ func (bc *BlockChain) loadLastState() error {
 		log.Warn("Head block missing, resetting chain", "hash", head)
 		return bc.Reset()
 	}
+
+	// Quorum
+	if privateStateRepository, err := bc.privateStateManager.StateRepository(currentBlock.Root()); err != nil {
+		if privateStateRepository == nil {
+			log.Warn("Head private state missing, resetting chain", "number", currentBlock.Number(), "hash", currentBlock.Hash())
+			return bc.Reset()
+		}
+		if _, err := privateStateRepository.DefaultState(); err != nil {
+			log.Warn("Head private state missing, resetting chain", "number", currentBlock.Number(), "hash", currentBlock.Hash())
+			return bc.Reset()
+		}
+	}
+	// /Quorum
+
 	// Everything seems to be fine, set as the head block
 	bc.currentBlock.Store(currentBlock)
 	headBlockGauge.Update(int64(currentBlock.NumberU64()))
@@ -483,8 +550,24 @@ func (bc *BlockChain) loadLastState() error {
 // was fast synced or full synced and in which state, the method will try to
 // delete minimal data from disk whilst retaining chain consistency.
 func (bc *BlockChain) SetHead(head uint64) error {
+	_, err := bc.SetHeadBeyondRoot(head, common.Hash{})
+	return err
+}
+
+// SetHeadBeyondRoot rewinds the local chain to a new head with the extra condition
+// that the rewind must pass the specified state root. This method is meant to be
+// used when rewiding with snapshots enabled to ensure that we go back further than
+// persistent disk layer. Depending on whether the node was fast synced or full, and
+// in which state, the method will try to delete minimal data from disk whilst
+// retaining chain consistency.
+//
+// The method returns the block number where the requested root cap was found.
+func (bc *BlockChain) SetHeadBeyondRoot(head uint64, root common.Hash) (uint64, error) {
 	bc.chainmu.Lock()
 	defer bc.chainmu.Unlock()
+
+	// Track the block number of the requested root hash
+	var rootNumber uint64 // (no root == always 0)
 
 	// Retrieve the last pivot block to short circuit rollbacks beyond it and the
 	// current freezer limit to start nuking id underflown
@@ -501,8 +584,16 @@ func (bc *BlockChain) SetHead(head uint64) error {
 				log.Error("Gap in the chain, rewinding to genesis", "number", header.Number, "hash", header.Hash())
 				newHeadBlock = bc.genesisBlock
 			} else {
-				// Block exists, keep rewinding until we find one with state
+				// Block exists, keep rewinding until we find one with state,
+				// keeping rewinding until we exceed the optional threshold
+				// root hash
+				beyondRoot := (root == common.Hash{}) // Flag whether we're beyond the requested root (no root, always true)
+
 				for {
+					// If a root threshold was requested but not yet crossed, check
+					if root != (common.Hash{}) && !beyondRoot && newHeadBlock.Root() == root {
+						beyondRoot, rootNumber = true, newHeadBlock.NumberU64()
+					}
 					if _, err := state.New(newHeadBlock.Root(), bc.stateCache, bc.snaps); err != nil {
 						log.Trace("Block state missing, rewinding further", "number", newHeadBlock.NumberU64(), "hash", newHeadBlock.Hash())
 						if pivot == nil || newHeadBlock.NumberU64() > *pivot {
@@ -513,8 +604,12 @@ func (bc *BlockChain) SetHead(head uint64) error {
 							newHeadBlock = bc.genesisBlock
 						}
 					}
-					log.Debug("Rewound to block with state", "number", newHeadBlock.NumberU64(), "hash", newHeadBlock.Hash())
-					break
+					if beyondRoot || newHeadBlock.NumberU64() == 0 {
+						log.Debug("Rewound to block with state", "number", newHeadBlock.NumberU64(), "hash", newHeadBlock.Hash())
+						break
+					}
+					log.Debug("Skipping block with threshold state", "number", newHeadBlock.NumberU64(), "hash", newHeadBlock.Hash(), "root", newHeadBlock.Root())
+					newHeadBlock = bc.GetBlock(newHeadBlock.ParentHash(), newHeadBlock.NumberU64()-1) // Keep rewinding
 				}
 			}
 			rawdb.WriteHeadBlockHash(db, newHeadBlock.Hash())
@@ -594,7 +689,7 @@ func (bc *BlockChain) SetHead(head uint64) error {
 	bc.txLookupCache.Purge()
 	bc.futureBlocks.Purge()
 
-	return bc.loadLastState()
+	return rootNumber, bc.loadLastState()
 }
 
 // FastSyncCommitHead sets the current head block to the one defined by the hash
@@ -666,22 +761,56 @@ func (bc *BlockChain) Processor() Processor {
 }
 
 // State returns a new mutable state based on the current HEAD block.
-func (bc *BlockChain) State() (*state.StateDB, *state.StateDB, error) {
+func (bc *BlockChain) State() (*state.StateDB, mps.PrivateStateRepository, error) {
 	return bc.StateAt(bc.CurrentBlock().Root())
 }
 
-// StateAt returns a new mutable state based on a particular point in time.
-func (bc *BlockChain) StateAt(root common.Hash) (*state.StateDB, *state.StateDB, error) {
-	publicStateDb, privateStateDb, err := state.NewDual(root, bc.stateCache, bc.snaps, bc.db, bc.privateStateCache, nil)
+// Quorum
+//
+// StatePSI returns a new mutable public state and a mutable private state for given PSI,
+// based on the current HEAD block.
+func (bc *BlockChain) StatePSI(psi types.PrivateStateIdentifier) (*state.StateDB, *state.StateDB, error) {
+	return bc.StateAtPSI(bc.CurrentBlock().Root(), psi)
+}
+
+// Quorum
+//
+// StatePSI returns a new mutable public state and a mutable private state for the given PSI,
+// based on a particular point in time.
+func (bc *BlockChain) StateAtPSI(root common.Hash, psi types.PrivateStateIdentifier) (*state.StateDB, *state.StateDB, error) {
+	publicStateDb, privateStateRepo, err := bc.StateAt(root)
 	if err != nil {
 		return nil, nil, err
 	}
+
+	privateStateDb, privateStateDbErr := privateStateRepo.StatePSI(psi)
+	if privateStateDbErr != nil {
+		return nil, nil, privateStateDbErr
+	}
+
 	return publicStateDb, privateStateDb, nil
 }
 
+// StateAt returns a new mutable public state and a new mutable private state repo
+// based on a particular point in time. The returned private state repo can be used
+// to obtain a mutable private state for a given PSI
+func (bc *BlockChain) StateAt(root common.Hash) (*state.StateDB, mps.PrivateStateRepository, error) {
+	publicStateDb, publicStateDbErr := state.New(root, bc.stateCache, bc.snaps)
+	if publicStateDbErr != nil {
+		return nil, nil, publicStateDbErr
+	}
+
+	privateStateRepo, privateStateRepoErr := bc.privateStateManager.StateRepository(root)
+	if privateStateRepoErr != nil {
+		return nil, nil, privateStateRepoErr
+	}
+
+	return publicStateDb, privateStateRepo, nil
+}
+
 // StateCache returns the caching database underpinning the blockchain instance.
-func (bc *BlockChain) StateCache() (state.Database, state.Database) {
-	return bc.stateCache, bc.privateStateCache
+func (bc *BlockChain) StateCache() state.Database {
+	return bc.stateCache
 }
 
 // Reset purges the entire blockchain, restoring it to its genesis state.
@@ -764,7 +893,7 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 	// Add the block to the canonical chain number scheme and mark as the head
 	batch := bc.db.NewBatch()
 	rawdb.WriteCanonicalHash(batch, block.Hash(), block.NumberU64())
-	rawdb.WriteTxLookupEntries(batch, block)
+	rawdb.WriteTxLookupEntriesByBlock(batch, block)
 	rawdb.WriteHeadBlockHash(batch, block.Hash())
 
 	// If the block is better than our head or is on a different chain, force update heads
@@ -920,6 +1049,35 @@ func (bc *BlockChain) GetReceiptsByHash(hash common.Hash) types.Receipts {
 	return receipts
 }
 
+// (Quorum) GetPMTPrivateReceiptsByHash retrieves the receipts for all internal private transactions (i.e. the private
+// transaction for a privacy marker transaction) in a given block.
+func (bc *BlockChain) GetPMTPrivateReceiptsByHash(ctx context.Context, hash common.Hash) (types.Receipts, error) {
+	psm, err := bc.privateStateManager.ResolveForUserContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	allReceipts := bc.GetReceiptsByHash(hash)
+
+	block := bc.GetBlockByHash(hash)
+	if block == nil {
+		return types.Receipts{}, nil
+	}
+
+	privateReceipts := make([]*types.Receipt, 0)
+	for i, tx := range block.Transactions() {
+		if tx.IsPrivacyMarker() {
+			receipt := allReceipts[i]
+			if receipt.PSReceipts != nil && receipt.PSReceipts[psm.ID] != nil {
+				privateReceipts = append(privateReceipts, receipt.PSReceipts[psm.ID])
+			} else {
+				return nil, errors.New("could not find receipt for private transaction")
+			}
+		}
+	}
+	return privateReceipts, nil
+}
+
 // GetBlocksFromHash returns the block corresponding to hash and up to n-1 ancestors.
 // [deprecated by eth/62]
 func (bc *BlockChain) GetBlocksFromHash(hash common.Hash, n int) (blocks []*types.Block) {
@@ -990,8 +1148,14 @@ func (bc *BlockChain) Stop() {
 	var snapBase common.Hash
 	if bc.snaps != nil {
 		var err error
-		if snapBase, err = bc.snaps.Journal(bc.CurrentBlock().Root()); err != nil {
-			log.Error("Failed to journal state snapshot", "err", err)
+		if bc.writeLegacyJournal {
+			if snapBase, err = bc.snaps.LegacyJournal(bc.CurrentBlock().Root()); err != nil {
+				log.Error("Failed to journal state snapshot", "err", err)
+			}
+		} else {
+			if snapBase, err = bc.snaps.Journal(bc.CurrentBlock().Root()); err != nil {
+				log.Error("Failed to journal state snapshot", "err", err)
+			}
 		}
 	}
 	// Ensure the state of a recent block is also stored to disk before exiting.
@@ -1030,6 +1194,10 @@ func (bc *BlockChain) Stop() {
 	if bc.cacheConfig.TrieCleanJournal != "" {
 		triedb := bc.stateCache.TrieDB()
 		triedb.SaveCache(bc.cacheConfig.TrieCleanJournal)
+	}
+	if bc.cacheConfig.PrivateTrieCleanJournal != "" {
+		triedb := bc.privateStateManager.TrieDB()
+		triedb.SaveCache(bc.cacheConfig.PrivateTrieCleanJournal)
 	}
 	log.Info("Blockchain stopped")
 }
@@ -1269,9 +1437,9 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 			// range. In this case, all tx indices of newly imported blocks should be
 			// generated.
 			if bc.txLookupLimit == 0 || ancientLimit <= bc.txLookupLimit || block.NumberU64() >= ancientLimit-bc.txLookupLimit {
-				rawdb.WriteTxLookupEntries(batch, block)
+				rawdb.WriteTxLookupEntriesByBlock(batch, block)
 			} else if rawdb.ReadTxIndexTail(bc.db) != nil {
-				rawdb.WriteTxLookupEntries(batch, block)
+				rawdb.WriteTxLookupEntriesByBlock(batch, block)
 			}
 			stats.processed++
 		}
@@ -1355,7 +1523,7 @@ func (bc *BlockChain) InsertReceiptChain(blockChain types.Blocks, receiptChain [
 			// Write all the data out into the database
 			rawdb.WriteBody(batch, block.Hash(), block.NumberU64(), block.Body())
 			rawdb.WriteReceipts(batch, block.Hash(), block.NumberU64(), receiptChain[i])
-			rawdb.WriteTxLookupEntries(batch, block) // Always write tx indices for live blocks, we assume they are needed
+			rawdb.WriteTxLookupEntriesByBlock(batch, block) // Always write tx indices for live blocks, we assume they are needed
 
 			// Write everything belongs to the blocks into the database. So that
 			// we can ensure all components of body is completed(body, receipts,
@@ -1473,11 +1641,11 @@ func (bc *BlockChain) writeKnownBlock(block *types.Block) error {
 }
 
 // WriteBlockWithState writes the block and all associated state to the database.
-func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.Receipt, logs []*types.Log, state, privateState *state.StateDB, emitHeadEvent bool) (status WriteStatus, err error) {
+func (bc *BlockChain) WriteBlockWithState(block *types.Block, receipts []*types.Receipt, logs []*types.Log, state *state.StateDB, psManager mps.PrivateStateRepository, emitHeadEvent bool) (status WriteStatus, err error) {
 	bc.chainmu.Lock()
 	defer bc.chainmu.Unlock()
 
-	return bc.writeBlockWithState(block, receipts, logs, state, privateState, emitHeadEvent)
+	return bc.writeBlockWithState(block, receipts, logs, state, psManager, emitHeadEvent)
 }
 
 // QUORUM
@@ -1510,7 +1678,7 @@ func (bc *BlockChain) CommitBlockWithState(deleteEmptyObjects bool, state, priva
 
 // writeBlockWithState writes the block and all associated state to the database,
 // but is expects the chain mutex to be held.
-func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.Receipt, logs []*types.Log, state, privateState *state.StateDB, emitHeadEvent bool) (status WriteStatus, err error) {
+func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.Receipt, logs []*types.Log, state *state.StateDB, psManager mps.PrivateStateRepository, emitHeadEvent bool) (status WriteStatus, err error) {
 	bc.wg.Add(1)
 	defer bc.wg.Done()
 
@@ -1522,20 +1690,11 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	// Make sure no inconsistent state is leaked during insertion
 	// Quorum
 	// Write private state changes to database
-	privateRoot, err := privateState.Commit(bc.chainConfig.IsEIP158(block.Number()))
+	err = psManager.CommitAndWrite(bc.chainConfig.IsEIP158(block.Number()), block)
 	if err != nil {
 		return NonStatTy, err
 	}
-	if err := rawdb.WritePrivateStateRoot(bc.db, block.Root(), privateRoot); err != nil {
-		log.Error("Failed writing private state root", "err", err)
-		return NonStatTy, err
-	}
-	// Explicit commit for privateStateTriedb
-	privateTriedb := bc.privateStateCache.TrieDB()
-	if err := privateTriedb.Commit(privateRoot, false, nil); err != nil {
-		return NonStatTy, err
-	}
-	// End Quorum
+	// /Quorum
 
 	currentBlock := bc.CurrentBlock()
 	localTd := bc.GetTd(currentBlock.Hash(), currentBlock.NumberU64())
@@ -1544,7 +1703,7 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	// Irrelevant of the canonical status, write the block itself to the database.
 	//
 	// Note all the components of block(td, hash->number map, header, body, receipts)
-	// should be written aeth/downloader/downloader.gotomically. BlockBatch is used for containing all components.
+	// should be written atomically. BlockBatch is used for containing all components.
 	blockBatch := bc.db.NewBatch()
 	rawdb.WriteTd(blockBatch, block.Hash(), block.NumberU64(), externTd)
 	rawdb.WriteBlock(blockBatch, block)
@@ -1722,27 +1881,6 @@ func (bc *BlockChain) InsertChain(chain types.Blocks) (int, error) {
 	return n, err
 }
 
-// Given a slice of public receipts and an overlapping (smaller) slice of
-// private receipts, return a new slice where the default for each location is
-// the public receipt but we take the private receipt in each place we have
-// one.
-func mergeReceipts(pub, priv types.Receipts) types.Receipts {
-	m := make(map[common.Hash]*types.Receipt)
-	for _, receipt := range pub {
-		m[receipt.TxHash] = receipt
-	}
-	for _, receipt := range priv {
-		m[receipt.TxHash] = receipt
-	}
-
-	ret := make(types.Receipts, 0, len(pub))
-	for _, pubReceipt := range pub {
-		ret = append(ret, m[pubReceipt.TxHash])
-	}
-
-	return ret
-}
-
 // insertChain is the internal implementation of InsertChain, which assumes that
 // 1) chains are contiguous, and 2) The chain mutex is held.
 //
@@ -1860,6 +1998,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 		bc.reportBlock(block, nil, err)
 		return it.index, err
 	}
+
 	// No validation errors for the first block (or chain prefix skipped)
 	for ; block != nil && err == nil || err == ErrKnownBlock; block, err = it.next() {
 		// If the chain is terminating, stop processing blocks
@@ -1929,12 +2068,11 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 			return it.index, err
 		}
 		// Quorum
-		privateStateRoot := rawdb.GetPrivateStateRoot(bc.db, parent.Root)
-		privateState, err := state.New(privateStateRoot, bc.privateStateCache, nil)
+		privateStateRepo, err := bc.privateStateManager.StateRepository(parent.Root)
 		if err != nil {
 			return it.index, err
 		}
-		// /Quorum
+		// End Quorum
 
 		// If we have a followup block, run that against the current state to pre-cache
 		// transactions and probabilistically some of the account/storage trie nodes.
@@ -1942,20 +2080,31 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 		if !bc.cacheConfig.TrieCleanNoPrefetch {
 			if followup, err := it.peek(); followup != nil && err == nil {
 				throwaway, _ := state.New(parent.Root, bc.stateCache, bc.snaps)
-				privatest, _ := state.New(privateStateRoot, bc.privateStateCache, nil)
-				go func(start time.Time, followup *types.Block, throwaway, privatest *state.StateDB, interrupt *uint32) {
-					bc.prefetcher.Prefetch(followup, throwaway, privatest, bc.vmConfig, &followupInterrupt)
 
-					blockPrefetchExecuteTimer.Update(time.Since(start))
-					if atomic.LoadUint32(interrupt) == 1 {
-						blockPrefetchInterruptMeter.Mark(1)
-					}
-				}(time.Now(), followup, throwaway, privatest, &followupInterrupt)
+				// Quorum
+				privateStateRepo, stateRepoErr := bc.privateStateManager.StateRepository(parent.Root)
+				if stateRepoErr == nil && privateStateRepo != nil {
+					throwawayPrivateStateRepo := privateStateRepo.Copy()
+
+					// Quorum: add privateStateThrowaway argument
+					go func(start time.Time, followup *types.Block, throwaway *state.StateDB, privateStateThrowaway mps.PrivateStateRepository, interrupt *uint32) {
+						bc.prefetcher.Prefetch(followup, throwaway, throwawayPrivateStateRepo, bc.vmConfig, &followupInterrupt)
+
+						blockPrefetchExecuteTimer.Update(time.Since(start))
+						if atomic.LoadUint32(interrupt) == 1 {
+							blockPrefetchInterruptMeter.Mark(1)
+						}
+					}(time.Now(), followup, throwaway, throwawayPrivateStateRepo, &followupInterrupt)
+				} else {
+					log.Warn("Unable to load the private state repository for pre-fetching", "stateRepoErr", stateRepoErr)
+				}
+				// End Quorum
 			}
 		}
 		// Process block using the parent state as reference point
 		substart := time.Now()
-		receipts, privateReceipts, logs, usedGas, err := bc.processor.Process(block, statedb, privateState, bc.vmConfig)
+
+		receipts, privateReceipts, logs, usedGas, err := bc.processor.Process(block, statedb, privateStateRepo, bc.vmConfig)
 		if err != nil {
 			bc.reportBlock(block, receipts, err)
 			atomic.StoreUint32(&followupInterrupt, 1)
@@ -1983,7 +2132,7 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 			return it.index, err
 		}
 
-		allReceipts := mergeReceipts(receipts, privateReceipts)
+		allReceipts := privateStateRepo.MergeReceipts(receipts, privateReceipts)
 		proctime := time.Since(start)
 		// Update the metrics touched during block validation
 		accountHashTimer.Update(statedb.AccountHashes) // Account hashes are complete, we can mark them
@@ -1993,14 +2142,18 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals bool) (int, er
 
 		// Write the block to the chain and get the status.
 		substart = time.Now()
-		status, err := bc.writeBlockWithState(block, allReceipts, logs, statedb, privateState, false)
+		status, err := bc.writeBlockWithState(block, allReceipts, logs, statedb, privateStateRepo, false)
 		atomic.StoreUint32(&followupInterrupt, 1)
 		if err != nil {
 			return it.index, err
 		}
+
+		// Quorum
 		if err := rawdb.WritePrivateBlockBloom(bc.db, block.NumberU64(), privateReceipts); err != nil {
 			return it.index, err
 		}
+		// End Quorum
+
 		// Update the metrics touched during block commit
 		accountCommitTimer.Update(statedb.AccountCommits)   // Account commits are complete, we can mark them
 		storageCommitTimer.Update(statedb.StorageCommits)   // Storage commits are complete, we can mark them
@@ -2375,6 +2528,8 @@ func (bc *BlockChain) update() {
 // sync, Geth will automatically construct the missing indices and delete
 // the extra indices.
 func (bc *BlockChain) maintainTxIndex(ancients uint64) {
+	defer bc.wg.Done()
+
 	// Before starting the actual maintenance, we need to handle a special case,
 	// where user might init Geth with an external ancient database. If so, we
 	// need to reindex all necessary transactions before starting to process any
@@ -2384,7 +2539,7 @@ func (bc *BlockChain) maintainTxIndex(ancients uint64) {
 		if bc.txLookupLimit != 0 && ancients > bc.txLookupLimit {
 			from = ancients - bc.txLookupLimit
 		}
-		rawdb.IndexTransactions(bc.db, from, ancients)
+		rawdb.IndexTransactions(bc.db, from, ancients, bc.quit)
 	}
 	// indexBlocks reindexes or unindexes transactions depending on user configuration
 	indexBlocks := func(tail *uint64, head uint64, done chan struct{}) {
@@ -2398,24 +2553,24 @@ func (bc *BlockChain) maintainTxIndex(ancients uint64) {
 				rawdb.WriteTxIndexTail(bc.db, 0)
 			} else {
 				// Prune all stale tx indices and record the tx index tail
-				rawdb.UnindexTransactions(bc.db, 0, head-bc.txLookupLimit+1)
+				rawdb.UnindexTransactions(bc.db, 0, head-bc.txLookupLimit+1, bc.quit)
 			}
 			return
 		}
 		// If a previous indexing existed, make sure that we fill in any missing entries
 		if bc.txLookupLimit == 0 || head < bc.txLookupLimit {
 			if *tail > 0 {
-				rawdb.IndexTransactions(bc.db, 0, *tail)
+				rawdb.IndexTransactions(bc.db, 0, *tail, bc.quit)
 			}
 			return
 		}
 		// Update the transaction index to the new chain state
 		if head-bc.txLookupLimit+1 < *tail {
 			// Reindex a part of missing indices and rewind index tail to HEAD-limit
-			rawdb.IndexTransactions(bc.db, head-bc.txLookupLimit+1, *tail)
+			rawdb.IndexTransactions(bc.db, head-bc.txLookupLimit+1, *tail, bc.quit)
 		} else {
 			// Unindex a part of stale indices and forward index tail to HEAD-limit
-			rawdb.UnindexTransactions(bc.db, *tail, head-bc.txLookupLimit+1)
+			rawdb.UnindexTransactions(bc.db, *tail, head-bc.txLookupLimit+1, bc.quit)
 		}
 	}
 	// Any reindexing done, start listening to chain events and moving the index window
@@ -2439,6 +2594,10 @@ func (bc *BlockChain) maintainTxIndex(ancients uint64) {
 		case <-done:
 			done = nil
 		case <-bc.quit:
+			if done != nil {
+				log.Info("Waiting background transaction indexer to exit")
+				<-done
+			}
 			return
 		}
 	}
@@ -2632,6 +2791,21 @@ func (bc *BlockChain) SubscribeBlockProcessingEvent(ch chan<- bool) event.Subscr
 	return bc.scope.Track(bc.blockProcFeed.Subscribe(ch))
 }
 
-func (bc *BlockChain) SupportsMultitenancy(context.Context) (*proto.PreAuthenticatedAuthenticationToken, bool) {
-	return nil, bc.isMultitenant
+// Quorum
+func (bc *BlockChain) SupportsMultitenancy(context.Context) bool {
+	return bc.quorumConfig.MultiTenantEnabled()
+}
+
+// PopulateSetPrivateState function pointer for updating private state
+// Quorum
+func (bc *BlockChain) PopulateSetPrivateState(ps func([]*types.Log, *state.StateDB, types.PrivateStateIdentifier)) {
+	bc.setPrivateState = ps
+}
+
+// CheckAndSetPrivateState function to update the private state as a part contract state extension
+// Quorum
+func (bc *BlockChain) CheckAndSetPrivateState(txLogs []*types.Log, privateState *state.StateDB, psi types.PrivateStateIdentifier) {
+	if bc.setPrivateState != nil {
+		bc.setPrivateState(txLogs, privateState, psi)
+	}
 }

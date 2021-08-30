@@ -27,8 +27,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/les"
-
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/accounts/pluggable"
@@ -43,7 +41,6 @@ import (
 	"github.com/ethereum/go-ethereum/internal/flags"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
-	"github.com/ethereum/go-ethereum/multitenancy"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/permission"
 	"github.com/ethereum/go-ethereum/plugin"
@@ -70,6 +67,7 @@ var (
 		utils.LegacyBootnodesV4Flag,
 		utils.LegacyBootnodesV5Flag,
 		utils.DataDirFlag,
+		utils.RaftLogDirFlag,
 		utils.AncientFlag,
 		utils.KeyStoreDirFlag,
 		utils.ExternalSignerFlag,
@@ -150,7 +148,7 @@ var (
 		utils.RopstenFlag,
 		utils.RinkebyFlag,
 		utils.GoerliFlag,
-		utils.YoloV1Flag,
+		utils.YoloV2Flag,
 		utils.VMEnableDebugFlag,
 		utils.NetworkIdFlag,
 		utils.EthStatsURLFlag,
@@ -160,10 +158,12 @@ var (
 		utils.LegacyGpoBlocksFlag,
 		utils.GpoPercentileFlag,
 		utils.LegacyGpoPercentileFlag,
+		utils.GpoMaxGasPriceFlag,
 		utils.EWASMInterpreterFlag,
 		utils.EVMInterpreterFlag,
 		configFileFlag,
 		// Quorum
+		utils.PrivateCacheTrieJournalFlag,
 		utils.QuorumImmutabilityThreshold,
 		utils.EnableNodePermissionFlag,
 		utils.RaftModeFlag,
@@ -181,6 +181,8 @@ var (
 		utils.AllowedFutureBlockTimeFlag,
 		utils.EVMCallTimeOutFlag,
 		utils.MultitenancyFlag,
+		utils.RevertReasonFlag,
+		utils.QuorumEnablePrivacyMarker,
 		utils.QuorumPTMUnixSocketFlag,
 		utils.QuorumPTMUrlFlag,
 		utils.QuorumPTMTimeoutFlag,
@@ -224,8 +226,8 @@ var (
 		utils.IPCDisabledFlag,
 		utils.IPCPathFlag,
 		utils.InsecureUnlockAllowedFlag,
-		utils.RPCGlobalGasCap,
-		utils.RPCGlobalTxFeeCap,
+		utils.RPCGlobalGasCapFlag,
+		utils.RPCGlobalTxFeeCapFlag,
 	}
 
 	whisperFlags = []cli.Flag{
@@ -257,6 +259,7 @@ func init() {
 	app.Commands = []cli.Command{
 		// See chaincmd.go:
 		initCommand,
+		mpsdbUpgradeCommand,
 		importCommand,
 		exportCommand,
 		importPreimagesCommand,
@@ -400,8 +403,6 @@ func geth(ctx *cli.Context) error {
 // startNode boots up the system node and all registered protocols, after which
 // it unlocks any requested accounts, and starts the RPC/IPC interfaces and the
 // miner.
-// Quorum
-// - Enrich eth/les service with ContractAuthorizationProvider for multitenancy support if prequisites are met
 func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend) {
 	log.DoEmitCheckpoints = ctx.GlobalBool(utils.EmitCheckpointsFlag.Name)
 	debug.Memsize.Add("node", stack)
@@ -437,29 +438,8 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend) {
 	ethClient := ethclient.NewClient(rpcClient)
 
 	// Quorum
-	// Set ContractAuthorizationProvider if multitenancy flag is on AND plugin security is configured
-	if ctx.GlobalBool(utils.MultitenancyFlag.Name) {
-		if stack.PluginManager().IsEnabled(plugin.SecurityPluginInterfaceName) {
-			var setContractAuthzProviderFunc func(dm multitenancy.ContractAuthorizationProvider)
-			// check if is light version to get the right function. but do we really support light mode?
-			if ctx.GlobalString(utils.SyncModeFlag.Name) == "light" {
-				var lesService *les.LightEthereum
-				if err := stack.Lifecycle(&lesService); err != nil {
-					utils.Fatalf("Failed to retrieve light ethereum service: %v", err)
-				}
-				setContractAuthzProviderFunc = lesService.SetContractAuthorizationManager
-			} else {
-				var ethService *eth.Ethereum
-				if err := stack.Lifecycle(&ethService); err != nil {
-					utils.Fatalf("Failed to retrieve ethereum service: %v", err)
-				}
-				setContractAuthzProviderFunc = ethService.SetContractAuthorizationProvider
-			}
-			log.Info("Node supports multitenancy")
-			setContractAuthzProviderFunc(&multitenancy.DefaultContractAuthorizationProvider{})
-		} else {
-			utils.Fatalf("multitenancy requires RPC Security Plugin to be configured")
-		}
+	if ctx.GlobalBool(utils.MultitenancyFlag.Name) && !stack.PluginManager().IsEnabled(plugin.SecurityPluginInterfaceName) {
+		utils.Fatalf("multitenancy requires RPC Security Plugin to be configured")
 	}
 	// End Quorum
 

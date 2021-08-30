@@ -20,7 +20,6 @@ import (
 	"errors"
 	"math"
 	"math/big"
-	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
@@ -230,10 +229,12 @@ func (st *StateTransition) preCheck() error {
 //
 // Quorum:
 // 1. Intrinsic gas is calculated based on the encrypted payload hash
-//    and NOT the actual private payload
+//    and NOT the actual private payload.
 // 2. For private transactions, we only deduct intrinsic gas from the gas pool
-//    regardless the current node is party to the transaction or not
-// 3. With multitenancy support, we enforce the party set in the contract index must contain all
+//    regardless the current node is party to the transaction or not.
+// 3. For privacy marker transactions, we only deduct the PMT gas from the gas pool. No gas is deducted
+//    for the internal private transaction, regardless of whether the current node is a party.
+// 4. With multitenancy support, we enforce the party set in the contract index must contain all
 //    parties from the transaction. This is to detect unauthorized access from a legit proxy contract
 //    to an unauthorized contract.
 func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
@@ -261,7 +262,6 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	snapshot := st.evm.StateDB.Snapshot()
 
 	var data []byte
-	var managedPartiesInTx []string
 	isPrivate := false
 	publicState := st.state
 	pmh := newPMH(st)
@@ -269,7 +269,7 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 		isPrivate = true
 		pmh.snapshot = snapshot
 		pmh.eph = common.BytesToEncryptedPayloadHash(st.data)
-		_, managedPartiesInTx, data, pmh.receivedPrivacyMetadata, err = private.P.Receive(pmh.eph)
+		_, _, data, pmh.receivedPrivacyMetadata, err = private.P.Receive(pmh.eph)
 		// Increment the public account nonce if:
 		// 1. Tx is private and *not* a participant of the group and either call or create
 		// 2. Tx is private we are part of the group and is a call
@@ -380,33 +380,6 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	}
 	// End Quorum - Privacy Enhancements
 
-	// Quorum
-	// do the affected contract managed party checks
-	if msg, ok := msg.(PrivateMessage); ok && isQuorum && st.evm.SupportsMultitenancy && msg.IsPrivate() {
-		if len(managedPartiesInTx) > 0 {
-			for _, address := range evm.AffectedContracts() {
-				managedPartiesInContract, err := st.evm.StateDB.GetManagedParties(address)
-				if err != nil {
-					return nil, err
-				}
-				// managed parties for public transactions is empty so nothing to check there
-				if len(managedPartiesInContract) > 0 {
-					if common.NotContainsAll(managedPartiesInContract, managedPartiesInTx) {
-						log.Debug("Managed parties check has failed for contract", "addr", address, "EPH",
-							pmh.eph.TerminalString(), "contractMP", managedPartiesInContract, "txMP", managedPartiesInTx)
-						st.evm.RevertToSnapshot(snapshot)
-						// TODO - see whether we can find a way to store this error and make it available via customizations to getTransactionReceipt
-						return &ExecutionResult{
-							UsedGas:    0,
-							Err:        ErrContractManagedPartiesCheckFailed,
-							ReturnData: nil,
-						}, nil
-					}
-				}
-			}
-		}
-	}
-
 	// Pay gas used during contract creation or execution (st.gas tracks remaining gas)
 	// However, if private contract then we don't want to do this else we can get
 	// a mismatch between a (non-participant) minter and (participant) validator,
@@ -418,20 +391,6 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 
 	st.refundGas()
 	st.state.AddBalance(st.evm.Coinbase, new(big.Int).Mul(new(big.Int).SetUint64(st.gasUsed()), st.gasPrice))
-
-	// Quorum
-	// for all contracts being created as the result of the transaction execution
-	// we build the index for them if multitenancy is enabled
-	if st.evm.SupportsMultitenancy {
-		addresses := evm.CreatedContracts()
-		for _, address := range addresses {
-			log.Debug("Save to extra data",
-				"address", strings.ToLower(address.Hex()),
-				"isPrivate", isPrivate,
-				"parties", managedPartiesInTx)
-			st.evm.StateDB.SetManagedParties(address, managedPartiesInTx)
-		}
-	}
 
 	if isPrivate {
 		return &ExecutionResult{

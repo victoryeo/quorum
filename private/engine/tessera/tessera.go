@@ -47,6 +47,10 @@ func (t *tesseraPrivateTxManager) submitJSON(method, path string, request interf
 	if t.features.HasFeature(engine.MultiTenancy) {
 		apiVersion = "vnd.tessera-2.1+"
 	}
+	if t.features.HasFeature(engine.MultiplePrivateStates) && path == "/groups/resident" {
+		// for the groups API the Content-type/Accept is application/json
+		apiVersion = ""
+	}
 	req, err := newOptionalJSONRequest(method, t.client.FullPath(path), request, apiVersion)
 	if err != nil {
 		return -1, fmt.Errorf("unable to build json request for (method:%s,path:%s). Cause: %v", method, path, err)
@@ -166,7 +170,10 @@ func (t *tesseraPrivateTxManager) StoreRaw(data []byte, from string) (common.Enc
 	}
 
 	cacheKey := eph.Hex()
-	var extra engine.ExtraMetadata
+	var extra = engine.ExtraMetadata{
+		ManagedParties: []string{from},
+		Sender:         from,
+	}
 	cacheKeyTemp := fmt.Sprintf("%s-incomplete", cacheKey)
 	t.cache.Set(cacheKeyTemp, cache.PrivateCacheItem{
 		Payload: data,
@@ -317,6 +324,11 @@ func (t *tesseraPrivateTxManager) receive(data common.EncryptedPayloadHash, isRa
 			ManagedParties: response.ManagedParties,
 			Sender:         response.SenderKey,
 		}
+	} else {
+		extra = engine.ExtraMetadata{
+			ManagedParties: response.ManagedParties,
+			Sender:         response.SenderKey,
+		}
 	}
 
 	t.cache.Set(cacheKey, cache.PrivateCacheItem{
@@ -419,6 +431,14 @@ func (t *tesseraPrivateTxManager) GetParticipants(txHash common.EncryptedPayload
 	split := strings.Split(string(out), ",")
 
 	return split, nil
+}
+
+func (t *tesseraPrivateTxManager) Groups() ([]engine.PrivacyGroup, error) {
+	response := make([]engine.PrivacyGroup, 0)
+	if _, err := t.submitJSON("GET", "/groups/resident", nil, &response); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
 
 func (t *tesseraPrivateTxManager) Name() string {

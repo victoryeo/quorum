@@ -23,7 +23,6 @@ import (
 	"math/big"
 	"os"
 	"os/signal"
-	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/cmd/utils"
@@ -404,7 +403,7 @@ func (api *RetestethAPI) SetChainParams(ctx context.Context, chainParams ChainPa
 	}
 	engine := &NoRewardEngine{inner: inner, rewardsOn: chainParams.SealEngine != "NoReward"}
 
-	blockchain, err := core.NewBlockChain(ethDb, nil, chainConfig, engine, vm.Config{}, nil, nil)
+	blockchain, err := core.NewBlockChain(ethDb, nil, chainConfig, engine, vm.Config{}, nil, nil, nil)
 	if err != nil {
 		return false, err
 	}
@@ -497,7 +496,7 @@ func (api *RetestethAPI) mineBlock() error {
 			}
 		}
 	}
-	statedb, pvtstdb, err := api.blockchain.StateAt(parent.Root())
+	statedb, pvtstdb, err := api.blockchain.StateAtPSI(parent.Root(), types.DefaultPrivateStateIdentifier)
 	if err != nil {
 		return err
 	}
@@ -527,6 +526,8 @@ func (api *RetestethAPI) mineBlock() error {
 					gasPool,
 					statedb, pvtstdb,
 					header, tx, &header.GasUsed, *api.blockchain.GetVMConfig(),
+					false,
+					nil,
 				)
 				if err != nil {
 					statedb.RevertToSnapshot(snap)
@@ -660,17 +661,18 @@ func (api *RetestethAPI) AccountRange(ctx context.Context,
 	}
 	parentHeader := api.blockchain.GetHeaderByHash(header.ParentHash)
 	var root common.Hash
-	var statedb, pvtst *state.StateDB
+	var statedb *state.StateDB
 	var err error
 	if parentHeader == nil || int(txIndex) >= len(block.Transactions()) {
 		root = header.Root
-		statedb, _, err = api.blockchain.StateAt(root)
+		statedb, _, err = api.blockchain.StateAtPSI(root, types.DefaultPrivateStateIdentifier)
 		if err != nil {
 			return AccountRangeResult{}, err
 		}
 	} else {
+		var pvtst *state.StateDB
 		root = parentHeader.Root
-		statedb, pvtst, err = api.blockchain.StateAt(root)
+		statedb, pvtst, err = api.blockchain.StateAtPSI(root, types.DefaultPrivateStateIdentifier)
 		if err != nil {
 			return AccountRangeResult{}, err
 		}
@@ -770,17 +772,18 @@ func (api *RetestethAPI) StorageRangeAt(ctx context.Context,
 	}
 	parentHeader := api.blockchain.GetHeaderByHash(header.ParentHash)
 	var root common.Hash
-	var statedb, pvtstdb *state.StateDB
+	var statedb *state.StateDB
 	var err error
 	if parentHeader == nil || int(txIndex) >= len(block.Transactions()) {
 		root = header.Root
-		statedb, _, err = api.blockchain.StateAt(root)
+		statedb, _, err = api.blockchain.StateAtPSI(root, types.DefaultPrivateStateIdentifier)
 		if err != nil {
 			return StorageRangeResult{}, err
 		}
 	} else {
+		var pvtstdb *state.StateDB
 		root = parentHeader.Root
-		statedb, pvtstdb, err = api.blockchain.StateAt(root)
+		statedb, pvtstdb, err = api.blockchain.StateAtPSI(root, types.DefaultPrivateStateIdentifier)
 		if err != nil {
 			return StorageRangeResult{}, err
 		}
@@ -844,16 +847,6 @@ func (api *RetestethAPI) ClientVersion(ctx context.Context) (string, error) {
 	return "Geth-" + params.VersionWithCommit(gitCommit, gitDate), nil
 }
 
-// splitAndTrim splits input separated by a comma
-// and trims excessive white space from the substrings.
-func splitAndTrim(input string) []string {
-	result := strings.Split(input, ",")
-	for i, r := range result {
-		result[i] = strings.TrimSpace(r)
-	}
-	return result
-}
-
 func retesteth(ctx *cli.Context) error {
 	log.Info("Welcome to retesteth!")
 	// register signer API with server
@@ -891,8 +884,8 @@ func retesteth(ctx *cli.Context) error {
 			Version:   "1.0",
 		},
 	}
-	vhosts := splitAndTrim(ctx.GlobalString(utils.HTTPVirtualHostsFlag.Name))
-	cors := splitAndTrim(ctx.GlobalString(utils.HTTPCORSDomainFlag.Name))
+	vhosts := utils.SplitAndTrim(ctx.GlobalString(utils.HTTPVirtualHostsFlag.Name))
+	cors := utils.SplitAndTrim(ctx.GlobalString(utils.HTTPCORSDomainFlag.Name))
 
 	// register apis and create handler stack
 	srv := rpc.NewServer()

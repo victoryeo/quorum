@@ -239,6 +239,10 @@ func SetupGenesisBlock(db ethdb.Database, genesis *Genesis) (*params.ChainConfig
 	if height == nil {
 		return newcfg, stored, fmt.Errorf("missing block number for head header hash")
 	}
+	if storedcfg.IsMPS != newcfg.IsMPS && *height > 0 {
+		// TODO once we implement the MPS upgrade logic the error message should be updated (to reflect the other ways of setting the IsMPS flag value)
+		return newcfg, stored, fmt.Errorf("the IsMPS (multiple private states support) flag once configured at block height 0 cannot be changed")
+	}
 	compatErr := storedcfg.CheckCompatible(newcfg, *height, rawdb.GetIsQuorumEIP155Activated(db))
 	if compatErr != nil && *height != 0 && compatErr.RewindTo != 0 {
 		return newcfg, stored, compatErr
@@ -274,8 +278,8 @@ func (g *Genesis) configOrDefault(ghash common.Hash) *params.ChainConfig {
 		return params.RinkebyChainConfig
 	case ghash == params.GoerliGenesisHash:
 		return params.GoerliChainConfig
-	case ghash == params.YoloV1GenesisHash:
-		return params.YoloV1ChainConfig
+	case ghash == params.YoloV2GenesisHash:
+		return params.YoloV2ChainConfig
 	default:
 		return params.AllEthashProtocolChanges
 	}
@@ -411,10 +415,11 @@ func DefaultGoerliGenesisBlock() *Genesis {
 	}
 }
 
-func DefaultYoloV1GenesisBlock() *Genesis {
+func DefaultYoloV2GenesisBlock() *Genesis {
+	// TODO: Update with yolov2 values + regenerate alloc data
 	return &Genesis{
-		Config:     params.YoloV1ChainConfig,
-		Timestamp:  0x5ed754f1,
+		Config:     params.YoloV2ChainConfig,
+		Timestamp:  0x5f91b932,
 		ExtraData:  hexutil.MustDecode("0x00000000000000000000000000000000000000000000000000000000000000008a37866fd3627c9205a37c8685666f32ec07bb1b0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
 		GasLimit:   0x47b760,
 		Difficulty: big.NewInt(1),

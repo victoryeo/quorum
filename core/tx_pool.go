@@ -26,6 +26,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/prque"
+	"github.com/ethereum/go-ethereum/core/mps"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/event"
@@ -33,6 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
 	pcore "github.com/ethereum/go-ethereum/permission/core"
+	"github.com/ethereum/go-ethereum/private"
 )
 
 const (
@@ -135,7 +137,7 @@ const (
 type blockChain interface {
 	CurrentBlock() *types.Block
 	GetBlock(hash common.Hash, number uint64) *types.Block
-	StateAt(root common.Hash) (*state.StateDB, *state.StateDB, error)
+	StateAt(root common.Hash) (*state.StateDB, mps.PrivateStateRepository, error)
 
 	SubscribeChainHeadEvent(ch chan<- ChainHeadEvent) event.Subscription
 }
@@ -560,6 +562,15 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 	}
 	if pool.chainconfig.IsQuorum {
 		// Quorum
+		if tx.IsPrivacyMarker() {
+			innerTx, _, _, _ := private.FetchPrivateTransaction(tx.Data())
+			if innerTx != nil {
+				if err := pool.validateTx(innerTx, local); err != nil {
+					return err
+				}
+			}
+		}
+
 		// Gas price must be zero for Quorum transaction
 		if tx.GasPriceIntCmp(common.Big0) != 0 {
 			return ErrInvalidGasPrice
@@ -856,6 +867,7 @@ func (pool *TxPool) addTxs(txs []*types.Transaction, local, sync bool) []error {
 			nilSlot++
 		}
 		errs[nilSlot] = err
+		nilSlot++
 	}
 	// Reorg the pool internals if needed and return
 	done := pool.requestPromoteExecutables(dirtyAddrs)

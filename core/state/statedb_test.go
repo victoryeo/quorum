@@ -29,11 +29,10 @@ import (
 	"testing"
 	"testing/quick"
 
-	"github.com/ethereum/go-ethereum/private/engine"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/private/engine"
 )
 
 // Tests that updating a state trie does not leak any database writes prior to
@@ -343,6 +342,20 @@ func newTestAction(addr common.Address, r *rand.Rand) testAction {
 				preimage := []byte{1}
 				hash := common.BytesToHash(preimage)
 				s.AddPreimage(hash, preimage)
+			},
+			args: make([]int64, 1),
+		},
+		{
+			name: "AddAddressToAccessList",
+			fn: func(a testAction, s *StateDB) {
+				s.AddAddressToAccessList(addr)
+			},
+		},
+		{
+			name: "AddSlotToAccessList",
+			fn: func(a testAction, s *StateDB) {
+				s.AddSlotToAccessList(addr,
+					common.Hash{byte(a.args[0])})
 			},
 			args: make([]int64, 1),
 		},
@@ -749,6 +762,180 @@ func TestMissingTrieNodes(t *testing.T) {
 	}
 }
 
+func TestStateDBAccessList(t *testing.T) {
+	// Some helpers
+	addr := func(a string) common.Address {
+		return common.HexToAddress(a)
+	}
+	slot := func(a string) common.Hash {
+		return common.HexToHash(a)
+	}
+
+	memDb := rawdb.NewMemoryDatabase()
+	db := NewDatabase(memDb)
+	state, _ := New(common.Hash{}, db, nil)
+	state.accessList = newAccessList()
+
+	verifyAddrs := func(astrings ...string) {
+		t.Helper()
+		// convert to common.Address form
+		var addresses []common.Address
+		var addressMap = make(map[common.Address]struct{})
+		for _, astring := range astrings {
+			address := addr(astring)
+			addresses = append(addresses, address)
+			addressMap[address] = struct{}{}
+		}
+		// Check that the given addresses are in the access list
+		for _, address := range addresses {
+			if !state.AddressInAccessList(address) {
+				t.Fatalf("expected %x to be in access list", address)
+			}
+		}
+		// Check that only the expected addresses are present in the acesslist
+		for address := range state.accessList.addresses {
+			if _, exist := addressMap[address]; !exist {
+				t.Fatalf("extra address %x in access list", address)
+			}
+		}
+	}
+	verifySlots := func(addrString string, slotStrings ...string) {
+		if !state.AddressInAccessList(addr(addrString)) {
+			t.Fatalf("scope missing address/slots %v", addrString)
+		}
+		var address = addr(addrString)
+		// convert to common.Hash form
+		var slots []common.Hash
+		var slotMap = make(map[common.Hash]struct{})
+		for _, slotString := range slotStrings {
+			s := slot(slotString)
+			slots = append(slots, s)
+			slotMap[s] = struct{}{}
+		}
+		// Check that the expected items are in the access list
+		for i, s := range slots {
+			if _, slotPresent := state.SlotInAccessList(address, s); !slotPresent {
+				t.Fatalf("input %d: scope missing slot %v (address %v)", i, s, addrString)
+			}
+		}
+		// Check that no extra elements are in the access list
+		index := state.accessList.addresses[address]
+		if index >= 0 {
+			stateSlots := state.accessList.slots[index]
+			for s := range stateSlots {
+				if _, slotPresent := slotMap[s]; !slotPresent {
+					t.Fatalf("scope has extra slot %v (address %v)", s, addrString)
+				}
+			}
+		}
+	}
+
+	state.AddAddressToAccessList(addr("aa"))          // 1
+	state.AddSlotToAccessList(addr("bb"), slot("01")) // 2,3
+	state.AddSlotToAccessList(addr("bb"), slot("02")) // 4
+	verifyAddrs("aa", "bb")
+	verifySlots("bb", "01", "02")
+
+	// Make a copy
+	stateCopy1 := state.Copy()
+	if exp, got := 4, state.journal.length(); exp != got {
+		t.Fatalf("journal length mismatch: have %d, want %d", got, exp)
+	}
+
+	// same again, should cause no journal entries
+	state.AddSlotToAccessList(addr("bb"), slot("01"))
+	state.AddSlotToAccessList(addr("bb"), slot("02"))
+	state.AddAddressToAccessList(addr("aa"))
+	if exp, got := 4, state.journal.length(); exp != got {
+		t.Fatalf("journal length mismatch: have %d, want %d", got, exp)
+	}
+	// some new ones
+	state.AddSlotToAccessList(addr("bb"), slot("03")) // 5
+	state.AddSlotToAccessList(addr("aa"), slot("01")) // 6
+	state.AddSlotToAccessList(addr("cc"), slot("01")) // 7,8
+	state.AddAddressToAccessList(addr("cc"))
+	if exp, got := 8, state.journal.length(); exp != got {
+		t.Fatalf("journal length mismatch: have %d, want %d", got, exp)
+	}
+
+	verifyAddrs("aa", "bb", "cc")
+	verifySlots("aa", "01")
+	verifySlots("bb", "01", "02", "03")
+	verifySlots("cc", "01")
+
+	// now start rolling back changes
+	state.journal.revert(state, 7)
+	if _, ok := state.SlotInAccessList(addr("cc"), slot("01")); ok {
+		t.Fatalf("slot present, expected missing")
+	}
+	verifyAddrs("aa", "bb", "cc")
+	verifySlots("aa", "01")
+	verifySlots("bb", "01", "02", "03")
+
+	state.journal.revert(state, 6)
+	if state.AddressInAccessList(addr("cc")) {
+		t.Fatalf("addr present, expected missing")
+	}
+	verifyAddrs("aa", "bb")
+	verifySlots("aa", "01")
+	verifySlots("bb", "01", "02", "03")
+
+	state.journal.revert(state, 5)
+	if _, ok := state.SlotInAccessList(addr("aa"), slot("01")); ok {
+		t.Fatalf("slot present, expected missing")
+	}
+	verifyAddrs("aa", "bb")
+	verifySlots("bb", "01", "02", "03")
+
+	state.journal.revert(state, 4)
+	if _, ok := state.SlotInAccessList(addr("bb"), slot("03")); ok {
+		t.Fatalf("slot present, expected missing")
+	}
+	verifyAddrs("aa", "bb")
+	verifySlots("bb", "01", "02")
+
+	state.journal.revert(state, 3)
+	if _, ok := state.SlotInAccessList(addr("bb"), slot("02")); ok {
+		t.Fatalf("slot present, expected missing")
+	}
+	verifyAddrs("aa", "bb")
+	verifySlots("bb", "01")
+
+	state.journal.revert(state, 2)
+	if _, ok := state.SlotInAccessList(addr("bb"), slot("01")); ok {
+		t.Fatalf("slot present, expected missing")
+	}
+	verifyAddrs("aa", "bb")
+
+	state.journal.revert(state, 1)
+	if state.AddressInAccessList(addr("bb")) {
+		t.Fatalf("addr present, expected missing")
+	}
+	verifyAddrs("aa")
+
+	state.journal.revert(state, 0)
+	if state.AddressInAccessList(addr("aa")) {
+		t.Fatalf("addr present, expected missing")
+	}
+	if got, exp := len(state.accessList.addresses), 0; got != exp {
+		t.Fatalf("expected empty, got %d", got)
+	}
+	if got, exp := len(state.accessList.slots), 0; got != exp {
+		t.Fatalf("expected empty, got %d", got)
+	}
+	// Check the copy
+	// Make a copy
+	state = stateCopy1
+	verifyAddrs("aa", "bb")
+	verifySlots("bb", "01", "02")
+	if got, exp := len(state.accessList.addresses), 2; got != exp {
+		t.Fatalf("expected empty, got %d", got)
+	}
+	if got, exp := len(state.accessList.slots), 1; got != exp {
+		t.Fatalf("expected empty, got %d", got)
+	}
+}
+
 // Quorum
 
 func TestStorageRoot(t *testing.T) {
@@ -783,58 +970,6 @@ func TestStorageRoot(t *testing.T) {
 }
 
 // End Quorum
-
-// Quorum - NewDual
-
-func TestStorageRootNewDual(t *testing.T) {
-
-	var (
-		pubMem                 = rawdb.NewMemoryDatabase()
-		privMem                = rawdb.NewMemoryDatabase()
-		pubDb                  = NewDatabase(pubMem)
-		privDb                 = NewDatabase(privMem)
-		pubState, privState, _ = NewDual(common.Hash{}, pubDb, nil, privMem, privDb, nil)
-		addr                   = common.Address{1}
-		key                    = common.Hash{1}
-		value                  = common.Hash{42}
-
-		empty = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
-	)
-
-	args := []struct {
-		db    Database
-		state *StateDB
-	}{
-		{
-			pubDb, pubState,
-		},
-		{
-			privDb, privState,
-		},
-	}
-
-	for _, arg := range args {
-		so := arg.state.GetOrNewStateObject(addr)
-
-		emptyRoot := so.storageRoot(arg.db)
-		if emptyRoot != empty {
-			t.Errorf("Invalid empty storage root, expected %x, got %x", empty, emptyRoot)
-		}
-
-		// add a bit of state
-		so.SetState(arg.db, key, value)
-		arg.state.Commit(false)
-
-		root := so.storageRoot(arg.db)
-		expected := common.HexToHash("63511abd258fa907afa30cb118b53744a4f49055bb3f531da512c6b866fc2ffb")
-
-		if expected != root {
-			t.Errorf("Invalid storage root, expected %x, got %x", expected, root)
-		}
-	}
-}
-
-// End Quorum - NewDual
 
 // Quorum - Privacy Enhancements
 func TestPrivacyMetadataIsSavedOnStateDbCommit(t *testing.T) {
@@ -982,7 +1117,6 @@ func TestPrivacyMetadataChangesAreRolledBackOnRevert(t *testing.T) {
 	if privMetaData.CreationTxHash != common.BytesToEncryptedPayloadHash([]byte("two")) {
 		t.Errorf("current privacy metadata creation tx hash does not match the expected value")
 	}
-
 }
 
 // End Quorum - Privacy Enhancements

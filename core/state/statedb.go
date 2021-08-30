@@ -29,7 +29,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -97,6 +96,9 @@ type StateDB struct {
 
 	preimages map[common.Hash][]byte
 
+	// Per-transaction access list
+	accessList *accessList
+
 	// Journal of state modifications. This is the backbone of
 	// Snapshot and RevertToSnapshot.
 	journal        *journal
@@ -134,17 +136,18 @@ func New(root common.Hash, db Database, snaps *snapshot.Tree) (*StateDB, error) 
 	// End Quorum - Privacy Enhancements
 
 	sdb := &StateDB{
-		db:    db,
-		trie:  tr,
-		snaps: snaps,
+		db:                  db,
+		trie:                tr,
+		snaps:               snaps,
+		stateObjects:        make(map[common.Address]*stateObject),
+		stateObjectsPending: make(map[common.Address]struct{}),
+		stateObjectsDirty:   make(map[common.Address]struct{}),
+		logs:                make(map[common.Hash][]*types.Log),
+		preimages:           make(map[common.Hash][]byte),
+		journal:             newJournal(),
+		accessList:          newAccessList(),
 		// Quorum - Privacy Enhancements
 		accountExtraDataTrie: accountExtraDataTrie,
-		stateObjects:         make(map[common.Address]*stateObject),
-		stateObjectsPending:  make(map[common.Address]struct{}),
-		stateObjectsDirty:    make(map[common.Address]struct{}),
-		logs:                 make(map[common.Hash][]*types.Log),
-		preimages:            make(map[common.Hash][]byte),
-		journal:              newJournal(),
 	}
 
 	if sdb.snaps != nil {
@@ -155,20 +158,6 @@ func New(root common.Hash, db Database, snaps *snapshot.Tree) (*StateDB, error) 
 		}
 	}
 	return sdb, nil
-}
-
-// Quorum
-// NewDual - Create a public and private state from a given public and private tree
-func NewDual(root common.Hash, db Database, snaps *snapshot.Tree, ethDb ethdb.Database, privateDb Database, privateSnaps *snapshot.Tree) (state, privateState *StateDB, err error) {
-	state, err = New(root, db, snaps)
-	if err != nil {
-		return nil, nil, err
-	}
-	privateState, err = New(rawdb.GetPrivateStateRoot(ethDb, root), privateDb, privateSnaps)
-	if err != nil {
-		return nil, nil, err
-	}
-	return state, privateState, nil
 }
 
 // setError remembers the first non-nil error it is called with.
@@ -209,6 +198,7 @@ func (s *StateDB) Reset(root common.Hash) error {
 			s.snapStorage = make(map[common.Hash]map[common.Hash][]byte)
 		}
 	}
+	s.accessList = newAccessList()
 	return nil
 }
 
@@ -276,7 +266,10 @@ func (s *StateDB) Exist(addr common.Address) bool {
 // or empty according to the EIP161 specification (balance = nonce = code = 0)
 func (s *StateDB) Empty(addr common.Address) bool {
 	so := s.getStateObject(addr)
-	return so == nil || so.empty()
+	if so != nil {
+		return so.empty()
+	}
+	return true
 }
 
 // GetBalance retrieves the balance from the given address or 0 if object not found
@@ -293,10 +286,10 @@ func (s *StateDB) GetNonce(addr common.Address) uint64 {
 	if stateObject != nil {
 		return stateObject.Nonce()
 	}
-
 	return 0
 }
 
+// Quorum
 func (s *StateDB) GetPrivacyMetadata(addr common.Address) (*PrivacyMetadata, error) {
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
@@ -305,6 +298,7 @@ func (s *StateDB) GetPrivacyMetadata(addr common.Address) (*PrivacyMetadata, err
 	return nil, nil
 }
 
+// Quorum
 func (s *StateDB) GetCommittedStatePrivacyMetadata(addr common.Address) (*PrivacyMetadata, error) {
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
@@ -313,6 +307,7 @@ func (s *StateDB) GetCommittedStatePrivacyMetadata(addr common.Address) (*Privac
 	return nil, nil
 }
 
+// Quorum
 func (self *StateDB) GetManagedParties(addr common.Address) ([]string, error) {
 	stateObject := self.getStateObject(addr)
 	if stateObject != nil {
@@ -817,6 +812,12 @@ func (s *StateDB) Copy() *StateDB {
 	for hash, preimage := range s.preimages {
 		state.preimages[hash] = preimage
 	}
+	// Do we need to copy the access list? In practice: No. At the start of a
+	// transaction, the access list is empty. In practice, we only ever copy state
+	// _between_ transactions/blocks, never in the middle of a transaction.
+	// However, it doesn't cost us much to copy an empty list, so we do it anyway
+	// to not blow up if we ever decide copy it in the middle of a transaction
+	state.accessList = s.accessList.Copy()
 	return state
 }
 
@@ -918,6 +919,7 @@ func (s *StateDB) Prepare(thash, bhash common.Hash, ti int) {
 	s.thash = thash
 	s.bhash = bhash
 	s.txIndex = ti
+	s.accessList = newAccessList()
 }
 
 func (s *StateDB) clearJournalAndRefund() {
@@ -967,7 +969,7 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 		start = time.Now()
 	}
 	var account Account
-	root, err := s.trie.Commit(func(leaf []byte, parent common.Hash) error {
+	root, err := s.trie.Commit(func(path []byte, leaf []byte, parent common.Hash) error {
 		if err := rlp.DecodeBytes(leaf, &account); err != nil {
 			return nil
 		}
@@ -989,8 +991,12 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 			if err := s.snaps.Update(root, parent, s.snapDestructs, s.snapAccounts, s.snapStorage); err != nil {
 				log.Warn("Failed to update snapshot tree", "from", parent, "to", root, "err", err)
 			}
-			if err := s.snaps.Cap(root, 127); err != nil { // Persistent layer is 128th, the last available trie
-				log.Warn("Failed to cap snapshot tree", "root", root, "layers", 127, "err", err)
+			// Keep 128 diff layers in the memory, persistent layer is 129th.
+			// - head layer is paired with HEAD state
+			// - head-1 layer is paired with HEAD-1 state
+			// - head-127 layer(bottom-most diff layer) is paired with HEAD-127 state
+			if err := s.snaps.Cap(root, 128); err != nil {
+				log.Warn("Failed to cap snapshot tree", "root", root, "layers", 128, "err", err)
 			}
 		}
 		s.snap, s.snapDestructs, s.snapAccounts, s.snapStorage = nil, nil, nil, nil
@@ -1015,4 +1021,39 @@ func (s *StateDB) Commit(deleteEmptyObjects bool) (common.Hash, error) {
 		s.db.TrieDB().Reference(extraDataRoot, root)
 	}
 	return root, err
+}
+
+// AddAddressToAccessList adds the given address to the access list
+func (s *StateDB) AddAddressToAccessList(addr common.Address) {
+	if s.accessList.AddAddress(addr) {
+		s.journal.append(accessListAddAccountChange{&addr})
+	}
+}
+
+// AddSlotToAccessList adds the given (address, slot)-tuple to the access list
+func (s *StateDB) AddSlotToAccessList(addr common.Address, slot common.Hash) {
+	addrMod, slotMod := s.accessList.AddSlot(addr, slot)
+	if addrMod {
+		// In practice, this should not happen, since there is no way to enter the
+		// scope of 'address' without having the 'address' become already added
+		// to the access list (via call-variant, create, etc).
+		// Better safe than sorry, though
+		s.journal.append(accessListAddAccountChange{&addr})
+	}
+	if slotMod {
+		s.journal.append(accessListAddSlotChange{
+			address: &addr,
+			slot:    &slot,
+		})
+	}
+}
+
+// AddressInAccessList returns true if the given address is in the access list.
+func (s *StateDB) AddressInAccessList(addr common.Address) bool {
+	return s.accessList.ContainsAddress(addr)
+}
+
+// SlotInAccessList returns true if the given (address, slot)-tuple is in the access list.
+func (s *StateDB) SlotInAccessList(addr common.Address, slot common.Hash) (addressPresent bool, slotPresent bool) {
+	return s.accessList.Contains(addr, slot)
 }

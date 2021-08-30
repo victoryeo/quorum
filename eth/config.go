@@ -38,12 +38,14 @@ import (
 var DefaultFullGPOConfig = gasprice.Config{
 	Blocks:     20,
 	Percentile: 60,
+	MaxPrice:   gasprice.DefaultMaxPrice,
 }
 
 // DefaultLightGPOConfig contains default gasprice oracle settings for light client.
 var DefaultLightGPOConfig = gasprice.Config{
 	Blocks:     2,
 	Percentile: 60,
+	MaxPrice:   gasprice.DefaultMaxPrice,
 }
 
 // DefaultConfig contains default settings for use on the Ethereum main net.
@@ -79,7 +81,9 @@ var DefaultConfig = Config{
 	GPO:         DefaultFullGPOConfig,
 	RPCTxFeeCap: 1, // 1 ether
 
-	Istanbul: *istanbul.DefaultConfig, // Quorum
+	// Quorum
+	Istanbul:                     *istanbul.DefaultConfig, // Quorum
+	PrivateTrieCleanCacheJournal: "privatetriecache",
 }
 
 func init() {
@@ -198,5 +202,8 @@ type Config struct {
 	EVMCallTimeOut time.Duration
 
 	// Quorum
-	EnableMultitenancy bool
+	core.QuorumChainConfig `toml:"-"`
+
+	// Quorum
+	PrivateTrieCleanCacheJournal string `toml:",omitempty"` // Disk journal directory for private trie cache to survive node restarts
 }
